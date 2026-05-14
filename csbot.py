@@ -1746,7 +1746,11 @@ async def cmd_summary(interaction: discord.Interaction):
     since_utc = since_ct_midnight - offset
 
     players = load_players()
-    channel = bot.get_channel(CHANNEL_ID)
+    channels = get_channels_for(bot, "daily_summary")
+    if not channels:
+        await interaction.followup.send("❌ No channels configured for daily summaries. Use /setchannel first.", ephemeral=True)
+        return
+
     async with aiohttp.ClientSession() as session:
         all_matches = await fetch_all_player_matches(session, players)
 
@@ -1761,7 +1765,8 @@ async def cmd_summary(interaction: discord.Interaction):
         return
 
     embed = build_daily_embed(player_data, now_ct)
-    await channel.send(embed=embed)
+    for ch in channels:
+        await ch.send(embed=embed)
     await interaction.followup.send("✅ Daily summary posted.", ephemeral=True)
 
 
@@ -1778,7 +1783,11 @@ async def cmd_weeklysummary(interaction: discord.Interaction):
     since_utc     = week_start_ct - offset
 
     players = load_players()
-    channel = bot.get_channel(CHANNEL_ID)
+    channels = get_channels_for(bot, "weekly_summary")
+    if not channels:
+        await interaction.followup.send("❌ No channels configured for weekly summaries. Use /setchannel first.", ephemeral=True)
+        return
+
     async with aiohttp.ClientSession() as session:
         all_matches = await fetch_all_player_matches(session, players)
 
@@ -1793,7 +1802,8 @@ async def cmd_weeklysummary(interaction: discord.Interaction):
         return
 
     embed = build_weekly_embed(player_data, week_start_ct, week_end_ct)
-    await channel.send(embed=embed)
+    for ch in channels:
+        await ch.send(embed=embed)
     await interaction.followup.send("✅ Weekly summary posted.", ephemeral=True)
 
 @tree.command(name="price", description="Check current CSFloat prices for a CS2 skin")
@@ -1946,11 +1956,6 @@ async def cmd_settings(interaction: discord.Interaction, setting: str = None, va
 async def summary_loop():
     """Background task that posts daily and weekly summaries at scheduled times."""
     await bot.wait_until_ready()
-    channels = get_all_channels(bot)
-    if not channels:
-        print("Summary loop: no channels configured")
-        return
-
     last_daily  = None
     last_weekly = None
 
@@ -1985,7 +1990,7 @@ async def summary_loop():
 
                     if player_data:
                         embed = build_daily_embed(player_data, now_ct)
-                        for ch in channels:
+                        for ch in get_channels_for(bot, "daily_summary"):
                             await ch.send(embed=embed)
                         print(f"Daily summary posted for {today_date}")
 
@@ -2013,7 +2018,7 @@ async def summary_loop():
 
                     if player_data:
                         embed = build_weekly_embed(player_data, week_start_ct, week_end_ct)
-                        for ch in channels:
+                        for ch in get_channels_for(bot, "weekly_summary"):
                             await ch.send(embed=embed)
                         print(f"Weekly summary posted for week ending {today_date}")
 
