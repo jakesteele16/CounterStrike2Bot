@@ -115,8 +115,10 @@ def save_state(state):
 
 LEETIFY_BASE = "https://api-public.cs-prod.leetify.com"
 
-# Steam IDs that returned 404 from Leetify — skip polling these to avoid spam
-LEETIFY_404_CACHE = set()
+# Steam IDs that returned 404 from Leetify, mapped to the timestamp of the 404.
+# Entries expire after 1 hour so newly-registered accounts get retried automatically.
+LEETIFY_404_CACHE: dict[str, float] = {}
+LEETIFY_404_TTL = 3600  # seconds
 
 def leetify_headers():
     if LEETIFY_API_KEY and LEETIFY_API_KEY != "YOUR_LEETIFY_API_KEY":
@@ -124,19 +126,22 @@ def leetify_headers():
     return {}
 
 async def fetch_recent_matches(session, steam_id):
-    if steam_id in LEETIFY_404_CACHE:
+    import time
+    cached_at = LEETIFY_404_CACHE.get(steam_id)
+    if cached_at and (time.time() - cached_at) < LEETIFY_404_TTL:
         return None
     url = f"{LEETIFY_BASE}/v3/profile/matches"
     params = {"steam64_id": steam_id}
     try:
         async with session.get(url, headers=leetify_headers(), params=params) as resp:
             if resp.status == 404:
-                LEETIFY_404_CACHE.add(steam_id)
-                print(f"Leetify 404 for {steam_id} — skipping future polls (no Leetify account)")
+                LEETIFY_404_CACHE[steam_id] = time.time()
+                print(f"Leetify 404 for {steam_id} — will retry in {LEETIFY_404_TTL//60}min")
                 return None
             if resp.status != 200:
                 print(f"Leetify matches {steam_id}: HTTP {resp.status}")
                 return None
+            LEETIFY_404_CACHE.pop(steam_id, None)  # clear cache on success
             return await resp.json()
     except Exception as e:
         print(f"Leetify fetch error ({steam_id}): {e}")
