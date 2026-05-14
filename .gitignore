@@ -1,0 +1,12 @@
+# Runtime state files
+cs2bot_channels.json
+cs2bot_players.json
+cs2bot_state.json
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
