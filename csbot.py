@@ -2034,6 +2034,431 @@ async def summary_loop():
         await asyncio.sleep(60)  # check every minute
 
 # ============================================================
+# CSFLOAT DEAL WATCHER
+# ============================================================
+
+import time as _time
+
+DEALS_FILE = "cs2bot_deals.json"
+
+# Cache: market_hash_name -> (timestamp_float, median_cents_int)
+DEAL_MEDIAN_CACHE: dict[str, tuple[float, int]] = {}
+DEAL_MEDIAN_TTL = 900  # 15 minutes
+
+
+def _default_deals_config():
+    return {
+        "enabled": False,
+        "channel_id": None,
+        # "knives" | "all" | "skin:<market_hash_name>"
+        "mode": "knives",
+        "min_discount": 0.30,       # fraction — 0.30 = 30% below median
+        "min_price_cents": 500,     # $5.00 floor on auction current price
+        "max_expires_minutes": 30,  # only auctions ending in ≤ N minutes
+        "seen_ids": {},             # listing_id -> expires_at ISO string (dedup)
+    }
+
+
+def load_deals_config():
+    if os.path.exists(DEALS_FILE):
+        with open(DEALS_FILE, "r") as f:
+            data = json.load(f)
+        # Backfill any missing keys from defaults
+        for k, v in _default_deals_config().items():
+            data.setdefault(k, v)
+        return data
+    return _default_deals_config()
+
+
+def save_deals_config(cfg):
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=".", delete=False, suffix=".tmp") as tmp:
+            json.dump(cfg, tmp, indent=2)
+            tmp_path = tmp.name
+        os.replace(tmp_path, DEALS_FILE)
+    except Exception as e:
+        print(f"[deals] save_deals_config error: {e}")
+
+
+def _purge_seen_ids(cfg):
+    """Remove entries from seen_ids whose auctions have already expired."""
+    now = datetime.now(timezone.utc)
+    kept = {}
+    for lid, exp_raw in cfg.get("seen_ids", {}).items():
+        try:
+            exp_dt = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            if exp_dt > now:
+                kept[lid] = exp_raw
+        except Exception:
+            pass  # drop malformed entries
+    cfg["seen_ids"] = kept
+
+
+def _csfloat_headers():
+    h = {}
+    if CSFLOAT_API_KEY and CSFLOAT_API_KEY != "YOUR_CSFLOAT_API_KEY":
+        h["Authorization"] = CSFLOAT_API_KEY
+    return h
+
+
+async def fetch_auction_page(session, page=0, min_price=None, market_hash_name=None):
+    """Fetch one page (up to 50) of CSFloat auction listings."""
+    from urllib.parse import urlencode
+    params = {"type": "auction", "limit": 50, "page": page}
+    if min_price is not None:
+        params["min_price"] = min_price
+    if market_hash_name:
+        params["market_hash_name"] = market_hash_name
+    url = f"{CSFLOAT_BASE}/listings?{urlencode(params)}"
+    try:
+        async with session.get(url, headers=_csfloat_headers()) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[deals] Auction page HTTP {resp.status}: {text[:150]}")
+                return []
+            data = await resp.json()
+            if isinstance(data, list):
+                return data
+            return data.get("data", [])
+    except Exception as e:
+        print(f"[deals] Auction page error: {e}")
+        return []
+
+
+async def get_csfloat_buy_now_median(session, market_hash_name):
+    """Return the median buy-now listing price (cents) for a skin, with 15-min TTL cache."""
+    cached = DEAL_MEDIAN_CACHE.get(market_hash_name)
+    if cached and (_time.time() - cached[0]) < DEAL_MEDIAN_TTL:
+        return cached[1]
+    listings, err = await fetch_csfloat_listings(session, market_hash_name, limit=50)
+    if err or not listings:
+        return None
+    prices = sorted(l["price"] for l in listings if l.get("price"))
+    if not prices:
+        return None
+    median = prices[len(prices) // 2]
+    DEAL_MEDIAN_CACHE[market_hash_name] = (_time.time(), median)
+    return median
+
+
+def _build_deal_embed(listing, median_cents, discount_frac, mode):
+    """Build a Discord embed for a single auction deal alert."""
+    item     = listing.get("item", {})
+    details  = listing.get("auction_details", {})
+    name     = item.get("market_hash_name", "Unknown Skin")
+    price_c  = listing.get("price", 0)
+    float_v  = item.get("float_value")
+    wear     = item.get("wear_name", "")
+    icon_url = item.get("icon_url", "")
+    lid      = listing.get("id", "")
+
+    # Expiry countdown
+    expires_raw = details.get("expires_at", "")
+    try:
+        exp_dt    = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+        mins_left = int((exp_dt - datetime.now(timezone.utc)).total_seconds() / 60)
+        exp_str   = f"{mins_left} min" if mins_left >= 1 else "<1 min"
+    except Exception:
+        exp_str = "?"
+
+    price_usd  = price_c / 100
+    median_usd = median_cents / 100
+    saved_usd  = median_usd - price_usd
+
+    embed = discord.Embed(
+        title=f"🔥 Deal Alert — {name}",
+        url=f"https://csfloat.com/item/{lid}",
+        color=0x00FF7F,
+        timestamp=datetime.now(timezone.utc)
+    )
+    if icon_url:
+        embed.set_thumbnail(url=f"https://images.csfloat.com/{icon_url}")
+
+    embed.add_field(name="💰 Auction Price",   value=f"**${price_usd:.2f}**",                        inline=True)
+    embed.add_field(name="📊 CSFloat Median",  value=f"${median_usd:.2f}",                           inline=True)
+    embed.add_field(name="📉 Discount",        value=f"**{discount_frac*100:.0f}% off** (save ${saved_usd:.2f})", inline=True)
+
+    float_str = f"{float_v:.6f}" if float_v is not None else "N/A"
+    embed.add_field(name="🎯 Float", value=f"{float_str} ({wear})" if wear else float_str, inline=True)
+    embed.add_field(name="⏰ Ends In", value=f"**{exp_str}**", inline=True)
+    embed.add_field(name="​", value=f"[View Auction on CSFloat](https://csfloat.com/item/{lid})", inline=False)
+    embed.set_footer(text=f"Mode: {mode} · CSFloat Deal Watcher")
+    return embed
+
+
+async def _scan_for_deals(session, cfg):
+    """
+    Scan CSFloat auction pages based on the current mode.
+    Returns list of (listing, median_cents, discount_frac) tuples for qualifying deals.
+    """
+    mode             = cfg.get("mode", "knives")
+    min_discount     = cfg.get("min_discount", 0.30)
+    min_price_cents  = cfg.get("min_price_cents", 500)
+    max_expires_min  = cfg.get("max_expires_minutes", 30)
+    seen_ids         = cfg.get("seen_ids", {})
+    now              = datetime.now(timezone.utc)
+
+    # Determine fetch params and page limit based on mode
+    if mode.startswith("skin:"):
+        skin_name   = mode[5:].strip()
+        fetch_kw    = {"market_hash_name": skin_name}
+        knife_filter = False
+        max_pages   = 5   # specific skin — usually <50 auctions total
+    elif mode == "knives":
+        fetch_kw    = {"min_price": min_price_cents}  # use configured floor — ★ filter applied client-side
+        knife_filter = True
+        max_pages   = 10
+    else:  # "all"
+        fetch_kw    = {"min_price": min_price_cents}
+        knife_filter = False
+        max_pages   = 10
+
+    results = []
+
+    for page_num in range(max_pages):
+        listings = await fetch_auction_page(session, page=page_num, **fetch_kw)
+        if not listings:
+            break  # No more pages
+
+        for listing in listings:
+            lid = listing.get("id")
+            if not lid or lid in seen_ids:
+                continue
+
+            price_c = listing.get("price", 0)
+            if price_c < min_price_cents:
+                continue
+
+            item = listing.get("item", {})
+            name = item.get("market_hash_name", "")
+
+            # Knife mode: require ★ prefix (CSFloat uses the Unicode star)
+            if knife_filter and "★" not in name:
+                continue
+
+            # Expiry window check
+            details     = listing.get("auction_details", {})
+            expires_raw = details.get("expires_at", "")
+            try:
+                exp_dt    = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
+                mins_left = (exp_dt - now).total_seconds() / 60
+                if mins_left > max_expires_min or mins_left < 0:
+                    continue
+            except Exception:
+                continue
+
+            # Fetch / cache buy-now median for this skin
+            median = await get_csfloat_buy_now_median(session, name)
+            if not median or median <= 0:
+                continue
+
+            discount = (median - price_c) / median
+            if discount < min_discount:
+                continue
+
+            results.append((listing, median, discount))
+
+        # Brief pause between page fetches to be polite to the API
+        await asyncio.sleep(0.5)
+
+    return results
+
+
+async def deal_watch_loop():
+    """Background task: polls CSFloat auctions every 5 minutes for qualifying deals."""
+    await bot.wait_until_ready()
+    print("[deals] Deal watcher loop started")
+
+    while not bot.is_closed():
+        try:
+            cfg = load_deals_config()
+
+            if not cfg.get("enabled"):
+                await asyncio.sleep(60)
+                continue
+
+            channel_id = cfg.get("channel_id")
+            if not channel_id:
+                await asyncio.sleep(60)
+                continue
+
+            channel = bot.get_channel(int(channel_id))
+            if not channel:
+                await asyncio.sleep(60)
+                continue
+
+            _purge_seen_ids(cfg)
+
+            async with aiohttp.ClientSession() as session:
+                deals = await _scan_for_deals(session, cfg)
+
+            mode = cfg.get("mode", "knives")
+            for listing, median, discount in deals:
+                lid         = listing.get("id")
+                expires_raw = listing.get("auction_details", {}).get("expires_at", "")
+                embed       = _build_deal_embed(listing, median, discount, mode)
+                try:
+                    await channel.send(embed=embed)
+                    skin_name = listing.get("item", {}).get("market_hash_name", lid)
+                    print(f"[deals] Posted: {skin_name} — {discount*100:.0f}% off")
+                except Exception as e:
+                    print(f"[deals] Post error: {e}")
+
+                cfg["seen_ids"][lid] = expires_raw
+                await asyncio.sleep(1)  # stagger multiple embeds slightly
+
+            save_deals_config(cfg)
+
+        except Exception as e:
+            print(f"[deals] Loop error: {e}")
+
+        await asyncio.sleep(300)  # poll every 5 minutes
+
+
+# ── /dealwatch command group ──────────────────────────────────
+
+_dw = app_commands.Group(name="dealwatch", description="CSFloat auction deal watcher")
+
+
+@_dw.command(name="on", description="Enable deal watcher in this channel")
+async def dealwatch_on(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not CSFLOAT_API_KEY or CSFLOAT_API_KEY == "YOUR_CSFLOAT_API_KEY":
+        await interaction.followup.send("❌ CSFloat API key not configured.", ephemeral=True)
+        return
+    cfg = load_deals_config()
+    cfg["enabled"]    = True
+    cfg["channel_id"] = interaction.channel_id
+    save_deals_config(cfg)
+    mode     = cfg.get("mode", "knives")
+    discount = int(cfg.get("min_discount", 0.30) * 100)
+    expires  = cfg.get("max_expires_minutes", 30)
+    floor    = cfg.get("min_price_cents", 500) / 100
+    await interaction.followup.send(
+        f"✅ Deal watcher **enabled** in this channel.\n"
+        f"Mode: `{mode}` · Min discount: `{discount}%` · Ends within: `{expires} min` · Floor: `${floor:.2f}`\n"
+        f"Polling every 5 minutes.",
+        ephemeral=True
+    )
+
+
+@_dw.command(name="off", description="Disable deal watcher")
+async def dealwatch_off(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    cfg = load_deals_config()
+    cfg["enabled"] = False
+    save_deals_config(cfg)
+    await interaction.followup.send("❌ Deal watcher disabled.", ephemeral=True)
+
+
+@_dw.command(name="status", description="Show current deal watcher configuration")
+async def dealwatch_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    cfg      = load_deals_config()
+    enabled  = cfg.get("enabled", False)
+    cid      = cfg.get("channel_id")
+    mode     = cfg.get("mode", "knives")
+    discount = int(cfg.get("min_discount", 0.30) * 100)
+    expires  = cfg.get("max_expires_minutes", 30)
+    floor    = cfg.get("min_price_cents", 500) / 100
+    seen     = len(cfg.get("seen_ids", {}))
+
+    embed = discord.Embed(
+        title="🔍 CSFloat Deal Watcher Status",
+        color=0x00FF7F if enabled else 0x888888,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Status",       value=f"{'✅ Enabled' if enabled else '❌ Disabled'}",  inline=True)
+    embed.add_field(name="Channel",      value=f"<#{cid}>" if cid else "Not set",                inline=True)
+    embed.add_field(name="Mode",         value=f"`{mode}`",                                      inline=True)
+    embed.add_field(name="Min Discount", value=f"`{discount}%` below buy-now median",            inline=True)
+    embed.add_field(name="Ends Within",  value=f"`{expires} min`",                               inline=True)
+    embed.add_field(name="Price Floor",  value=f"`${floor:.2f}`",                                inline=True)
+    embed.add_field(name="Dedup Cache",  value=f"{seen} active listing(s) suppressed",           inline=True)
+    embed.set_footer(text="Use /dealwatch mode · /dealwatch discount · /dealwatch floor · /dealwatch expires")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@_dw.command(name="mode", description='Set filter: "knives", "all", or "skin" for a specific skin')
+@app_commands.describe(
+    filter_mode='knives — knife auctions only | all — everything above floor | skin — one specific skin',
+    skin='Required if filter_mode is "skin". Exact CSFloat market_hash_name (e.g. "★ Karambit | Doppler (Factory New)")'
+)
+async def dealwatch_mode(interaction: discord.Interaction, filter_mode: str, skin: str = None):
+    await interaction.response.defer(ephemeral=True)
+    filter_mode = filter_mode.lower().strip()
+
+    if filter_mode not in ("knives", "all", "skin"):
+        await interaction.followup.send('❌ filter_mode must be `knives`, `all`, or `skin`.', ephemeral=True)
+        return
+
+    if filter_mode == "skin" and not skin:
+        await interaction.followup.send(
+            '❌ Provide the `skin` parameter when using `skin` mode.\n'
+            'Example: `/dealwatch mode filter_mode:skin skin:★ Karambit | Doppler (Factory New)`',
+            ephemeral=True
+        )
+        return
+
+    cfg = load_deals_config()
+    if filter_mode == "skin":
+        cfg["mode"] = f"skin:{skin}"
+        msg = f"✅ Mode set to **skin** — watching `{skin}`."
+    elif filter_mode == "knives":
+        cfg["mode"] = "knives"
+        msg = "✅ Mode set to **knives** — watching all knife auctions (★) ≥$100."
+    else:
+        cfg["mode"] = "all"
+        msg = "✅ Mode set to **all** — watching all auctions above the price floor."
+
+    save_deals_config(cfg)
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@_dw.command(name="discount", description="Set minimum discount % vs CSFloat buy-now median (default: 30)")
+@app_commands.describe(percent="Percentage below median required to alert, e.g. 30 for 30%")
+async def dealwatch_discount(interaction: discord.Interaction, percent: int):
+    await interaction.response.defer(ephemeral=True)
+    if percent < 5 or percent > 95:
+        await interaction.followup.send("❌ Discount must be between 5 and 95.", ephemeral=True)
+        return
+    cfg = load_deals_config()
+    cfg["min_discount"] = percent / 100
+    save_deals_config(cfg)
+    await interaction.followup.send(f"✅ Min discount set to **{percent}%** below CSFloat buy-now median.", ephemeral=True)
+
+
+@_dw.command(name="floor", description="Set minimum auction price floor in USD (default: $5)")
+@app_commands.describe(dollars="Minimum current auction price in USD, e.g. 10 for $10.00")
+async def dealwatch_floor(interaction: discord.Interaction, dollars: float):
+    await interaction.response.defer(ephemeral=True)
+    if dollars < 0.01 or dollars > 100000:
+        await interaction.followup.send("❌ Floor must be between $0.01 and $100,000.", ephemeral=True)
+        return
+    cfg = load_deals_config()
+    cfg["min_price_cents"] = int(dollars * 100)
+    save_deals_config(cfg)
+    await interaction.followup.send(f"✅ Price floor set to **${dollars:.2f}**.", ephemeral=True)
+
+
+@_dw.command(name="expires", description="Set max minutes until auction end (default: 30)")
+@app_commands.describe(minutes="Only alert for auctions ending within this many minutes, e.g. 20")
+async def dealwatch_expires(interaction: discord.Interaction, minutes: int):
+    await interaction.response.defer(ephemeral=True)
+    if minutes < 1 or minutes > 240:
+        await interaction.followup.send("❌ Expiry window must be between 1 and 240 minutes.", ephemeral=True)
+        return
+    cfg = load_deals_config()
+    cfg["max_expires_minutes"] = minutes
+    save_deals_config(cfg)
+    await interaction.followup.send(f"✅ Expiry window set to **≤{minutes} minutes**.", ephemeral=True)
+
+
+tree.add_command(_dw)
+
+
+# ============================================================
 # STARTUP
 # ============================================================
 
@@ -2043,5 +2468,6 @@ async def on_ready():
     print(f"CS2Bot online as {bot.user} — slash commands synced")
     bot.loop.create_task(poll_loop())
     bot.loop.create_task(summary_loop())
+    bot.loop.create_task(deal_watch_loop())
 
 bot.run(DISCORD_TOKEN)
