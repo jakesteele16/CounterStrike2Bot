@@ -1607,6 +1607,12 @@ def build_daily_embed(player_data, post_date):
             bs = score_display(bm["match"].get("team_scores", []), bm["match"].get("initial_team_number"))
             moments.append(f"🏆 Best Match: **{best_rating_name}** `{fmt(bm['rating']*100, 2)}` on {map_display(bm['map'])} ({bs})")
 
+        worst_rating_name, worst_rating_agg = min(all_aggs, key=lambda x: x[1].get("worst_match", {}).get("rating") or 99)
+        wm = worst_rating_agg.get("worst_match")
+        if wm:
+            ws = score_display(wm["match"].get("team_scores", []), wm["match"].get("initial_team_number"))
+            moments.append(f"💩 Worst Match: **{worst_rating_name}** `{fmt(wm['rating']*100, 2)}` on {map_display(wm['map'])} ({ws})")
+
         best_adr_name, best_adr_agg = max(all_aggs, key=lambda x: x[1].get("avg_adr") or 0)
         moments.append(f"💣 Best ADR: **{best_adr_name}** `{fmt(best_adr_agg.get('avg_adr'), 1)}`")
 
@@ -1705,6 +1711,12 @@ def build_weekly_embed(player_data, week_start, week_end):
 
         most_deaths = max(agg_list, key=lambda x: x[1]["total_deaths"])
         awards.append(f"💀 Most Deaths: **{most_deaths[0]}** `{most_deaths[1]['total_deaths']}`")
+
+        worst_match_player = min(agg_list, key=lambda x: x[1].get("worst_match", {}).get("rating") or 99)
+        wm = worst_match_player[1].get("worst_match")
+        if wm:
+            ws = score_display(wm["match"].get("team_scores", []), wm["match"].get("initial_team_number"))
+            awards.append(f"💩 Worst Match: **{worst_match_player[0]}** `{fmt(wm['rating']*100, 2)}` on {map_display(wm['map'])} ({ws})")
 
         best_kd = max(agg_list, key=lambda x: x[1].get("avg_kd") or 0)
         awards.append(f"🧠 Best Avg K/D: **{best_kd[0]}** `{fmt(best_kd[1].get('avg_kd'), 2)}`")
