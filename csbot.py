@@ -2066,6 +2066,7 @@ def _default_deals_config():
         "mode": "knives",
         "min_discount": 0.30,       # fraction — 0.30 = 30% below median
         "min_price_cents": 500,     # $5.00 floor on auction current price
+        "max_price_cents": 100000,  # $1,000 ceiling on auction current price
         "max_expires_minutes": 30,  # only auctions ending in ≤ N minutes
         "seen_ids": {},             # listing_id -> expires_at ISO string (dedup)
     }
@@ -2114,12 +2115,14 @@ def _csfloat_headers():
     return h
 
 
-async def fetch_auction_page(session, page=0, min_price=None, market_hash_name=None):
+async def fetch_auction_page(session, page=0, min_price=None, max_price=None, market_hash_name=None):
     """Fetch one page (up to 50) of CSFloat auction listings."""
     from urllib.parse import urlencode
     params = {"type": "auction", "limit": 50, "page": page}
     if min_price is not None:
         params["min_price"] = min_price
+    if max_price is not None:
+        params["max_price"] = max_price
     if market_hash_name:
         params["market_hash_name"] = market_hash_name
     url = f"{CSFLOAT_BASE}/listings?{urlencode(params)}"
@@ -2207,24 +2210,26 @@ async def _scan_for_deals(session, cfg):
     mode             = cfg.get("mode", "knives")
     min_discount     = cfg.get("min_discount", 0.30)
     min_price_cents  = cfg.get("min_price_cents", 500)
+    max_price_cents  = cfg.get("max_price_cents", 100000)
     max_expires_min  = cfg.get("max_expires_minutes", 30)
     seen_ids         = cfg.get("seen_ids", {})
     now              = datetime.now(timezone.utc)
+    found_this_run   = set()  # dedup within a single scan (catches pagination overlap)
 
     # Determine fetch params and page limit based on mode
     if mode.startswith("skin:"):
-        skin_name   = mode[5:].strip()
-        fetch_kw    = {"market_hash_name": skin_name}
+        skin_name    = mode[5:].strip()
+        fetch_kw     = {"market_hash_name": skin_name}
         knife_filter = False
-        max_pages   = 5   # specific skin — usually <50 auctions total
+        max_pages    = 5   # specific skin — usually <50 auctions total
     elif mode == "knives":
-        fetch_kw    = {"min_price": min_price_cents}  # use configured floor — ★ filter applied client-side
+        fetch_kw     = {"min_price": min_price_cents, "max_price": max_price_cents}
         knife_filter = True
-        max_pages   = 10
+        max_pages    = 10
     else:  # "all"
-        fetch_kw    = {"min_price": min_price_cents}
+        fetch_kw     = {"min_price": min_price_cents, "max_price": max_price_cents}
         knife_filter = False
-        max_pages   = 10
+        max_pages    = 10
 
     results = []
 
@@ -2235,11 +2240,11 @@ async def _scan_for_deals(session, cfg):
 
         for listing in listings:
             lid = listing.get("id")
-            if not lid or lid in seen_ids:
+            if not lid or lid in seen_ids or lid in found_this_run:
                 continue
 
             price_c = listing.get("price", 0)
-            if price_c < min_price_cents:
+            if price_c < min_price_cents or price_c > max_price_cents:
                 continue
 
             item = listing.get("item", {})
@@ -2269,6 +2274,7 @@ async def _scan_for_deals(session, cfg):
             if discount < min_discount:
                 continue
 
+            found_this_run.add(lid)
             results.append((listing, median, discount))
 
         # Brief pause between page fetches to be polite to the API
@@ -2310,17 +2316,16 @@ async def deal_watch_loop():
                 lid         = listing.get("id")
                 expires_raw = listing.get("auction_details", {}).get("expires_at", "")
                 embed       = _build_deal_embed(listing, median, discount, mode)
+                # Mark seen before posting — prevents re-alert even if send() throws
+                cfg["seen_ids"][lid] = expires_raw
+                save_deals_config(cfg)
                 try:
                     await channel.send(embed=embed)
                     skin_name = listing.get("item", {}).get("market_hash_name", lid)
                     print(f"[deals] Posted: {skin_name} — {discount*100:.0f}% off")
                 except Exception as e:
                     print(f"[deals] Post error: {e}")
-
-                cfg["seen_ids"][lid] = expires_raw
                 await asyncio.sleep(1)  # stagger multiple embeds slightly
-
-            save_deals_config(cfg)
 
         except Exception as e:
             print(f"[deals] Loop error: {e}")
@@ -2374,6 +2379,7 @@ async def dealwatch_status(interaction: discord.Interaction):
     discount = int(cfg.get("min_discount", 0.30) * 100)
     expires  = cfg.get("max_expires_minutes", 30)
     floor    = cfg.get("min_price_cents", 500) / 100
+    ceiling  = cfg.get("max_price_cents", 100000) / 100
     seen     = len(cfg.get("seen_ids", {}))
 
     embed = discord.Embed(
@@ -2386,9 +2392,10 @@ async def dealwatch_status(interaction: discord.Interaction):
     embed.add_field(name="Mode",         value=f"`{mode}`",                                      inline=True)
     embed.add_field(name="Min Discount", value=f"`{discount}%` below buy-now median",            inline=True)
     embed.add_field(name="Ends Within",  value=f"`{expires} min`",                               inline=True)
-    embed.add_field(name="Price Floor",  value=f"`${floor:.2f}`",                                inline=True)
+    embed.add_field(name="Price Floor",  value=f"`${floor:,.2f}`",                               inline=True)
+    embed.add_field(name="Price Ceiling",value=f"`${ceiling:,.2f}`",                             inline=True)
     embed.add_field(name="Dedup Cache",  value=f"{seen} active listing(s) suppressed",           inline=True)
-    embed.set_footer(text="Use /dealwatch mode · /dealwatch discount · /dealwatch floor · /dealwatch expires")
+    embed.set_footer(text="Use /dealwatch mode · /dealwatch discount · /dealwatch floor · /dealwatch ceiling · /dealwatch expires")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2454,6 +2461,19 @@ async def dealwatch_floor(interaction: discord.Interaction, dollars: float):
     await interaction.followup.send(f"✅ Price floor set to **${dollars:.2f}**.", ephemeral=True)
 
 
+@_dw.command(name="ceiling", description="Set maximum auction price in USD (default: $1,000)")
+@app_commands.describe(dollars="Skip auctions currently above this price, e.g. 1000 for $1,000")
+async def dealwatch_ceiling(interaction: discord.Interaction, dollars: float):
+    await interaction.response.defer(ephemeral=True)
+    if dollars < 1 or dollars > 1000000:
+        await interaction.followup.send("❌ Ceiling must be between $1 and $1,000,000.", ephemeral=True)
+        return
+    cfg = load_deals_config()
+    cfg["max_price_cents"] = int(dollars * 100)
+    save_deals_config(cfg)
+    await interaction.followup.send(f"✅ Price ceiling set to **${dollars:,.2f}**.", ephemeral=True)
+
+
 @_dw.command(name="expires", description="Set max minutes until auction end (default: 30)")
 @app_commands.describe(minutes="Only alert for auctions ending within this many minutes, e.g. 20")
 async def dealwatch_expires(interaction: discord.Interaction, minutes: int):
@@ -2478,8 +2498,12 @@ tree.add_command(_dw)
 async def on_ready():
     await tree.sync()
     print(f"CS2Bot online as {bot.user} — slash commands synced")
-    bot.loop.create_task(poll_loop())
-    bot.loop.create_task(summary_loop())
-    bot.loop.create_task(deal_watch_loop())
+    # Guard: on_ready fires on every reconnect, not just initial startup.
+    # Only create background tasks once to avoid duplicate loops.
+    if not getattr(bot, "_tasks_started", False):
+        bot._tasks_started = True
+        bot.loop.create_task(poll_loop())
+        bot.loop.create_task(summary_loop())
+        bot.loop.create_task(deal_watch_loop())
 
 bot.run(DISCORD_TOKEN)
